@@ -2,9 +2,14 @@ import json
 import os
 import random
 import re
+import smtplib
 import time
 import urllib.parse
 from datetime import datetime, timedelta
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 import pandas as pd
@@ -13,10 +18,6 @@ import pandas as pd
 DAYS_LIMIT = 3
 CUTOFF_TIME = datetime.now() - timedelta(days=DAYS_LIMIT)
 CUTOFF_TS = int(CUTOFF_TIME.timestamp())
-
-# 從 GitHub Secrets 讀取 Teams Webhook 網址與倉庫網址
-TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")
-GITHUB_RUN_URL = os.environ.get("GITHUB_RUN_URL", "https://github.com")
 
 TARGET_CHANNELS = [
     "萬家福", "樂家康", "家樂福", "Mia C'bon",
@@ -53,7 +54,7 @@ AD_NOISE_PATTERNS = [
 
 TARGET_FOUR_BRANDS = ["萬家福", "家樂福", "樂家康", "Mia C'bon", "miacbon", "MIA C'BON"]
 
-# ================= 2. 語意消歧過濾器（根治「愛買」與「全家」誤判） =================
+# ================= 2. 語意消歧過濾器 =================
 AMART_STRICT_BRAND_WORDS = [
     "a.mart", "amart", "愛買量販", "遠東愛買", "happy go", "遠東百貨", "遠百",
     "南雅店", "忠孝店", "景美店", "三重店", "永和店", "桃園店", "楊梅店",
@@ -267,60 +268,61 @@ def fetch_all_dcard(session):
         time.sleep(random.uniform(1.5, 2.5))
     return results
 
-# ================= 4. 發送摘要與報表連結至 Teams =================
-def send_to_teams(df_price, df_employee, df_customer, filename):
-    if not TEAMS_WEBHOOK_URL:
-        print("未設定 TEAMS_WEBHOOK_URL，略過 Teams 推播。")
+# ================= 4. 自動寄送 Email（夾帶完整 Excel 報表） =================
+def send_email_with_excel(df_price, df_employee, df_customer, filename):
+    gmail_user = os.environ.get("GMAIL_USER", "")
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
+    receivers = os.environ.get("RECEIVER_EMAILS", "")
+
+    if not (gmail_user and gmail_pass and receivers):
+        print("尚未設定完整 Gmail 寄信參數，略過寄信。")
         return
 
-    # 挑選最多 5 則重點貼文預覽直接顯示在 Teams 卡片上，讓同事不用開檔也能先看重點
-    preview_lines = []
-    for label, sub_df in [("價格問題", df_price), ("員工抱怨", df_employee), ("顧客抱怨", df_customer)]:
-        for _, row in sub_df.head(2).iterrows():
-            snippet = row["貼文內容"][:55].replace("\n", " ")
-            preview_lines.append(f"- **[{label} / {row['來源/看板']}]** {snippet}... ([原文]({row['原文連結']}))")
-
-    preview_text = "\n".join(preview_lines) if preview_lines else "今日無新增重點摘要。"
     today_tw = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+    total_count = len(df_price) + len(df_employee) + len(df_customer)
 
-    payload = {
-        "type": "message",
-        "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "content": {
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "type": "AdaptiveCard",
-                "version": "1.4",
-                "body": [
-                    {
-                        "type": "TextBlock",
-                        "size": "Medium",
-                        "weight": "Bolder",
-                        "text": f"📊 零售通路每日輿情三分類日報 ({today_tw})"
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": (
-                            f"過去 3 天內共彙整 **{len(df_price) + len(df_employee) + len(df_customer)} 筆**討論（Threads / PTT / Dcard）：\n\n"
-                            f"1️⃣ **價格方面問題**：{len(df_price)} 筆\n"
-                            f"2️⃣ **員工抱怨與建議**：{len(df_employee)} 筆\n"
-                            f"3️⃣ **顧客抱怨與建議**：{len(df_customer)} 筆\n\n"
-                            f"**今日重點速覽：**\n{preview_text}"
-                        ),
-                        "wrap": True
-                    }
-                ],
-                "actions": [{
-                    "type": "Action.OpenUrl",
-                    "title": f"📥 前往下載完整 Excel ({filename})",
-                    "url": GITHUB_RUN_URL
-                }]
-            }
-        }]
-    }
+    preview_lines = []
+    for label, sub_df in [("價格方面問題", df_price), ("員工抱怨與建議", df_employee), ("顧客抱怨與建議", df_customer)]:
+        for _, row in sub_df.head(3).iterrows():
+            snippet = row["貼文內容"][:60].replace("\n", " ")
+            preview_lines.append(f"<li><b>[{label} / {row['來源/看板']}]</b> {snippet}... (<a href='{row['原文連結']}'>原文</a>)</li>")
+    preview_html = "".join(preview_lines) if preview_lines else "<li>今日無新增重點摘要。</li>"
 
-    resp = requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=15)
-    print("Teams 推播狀態碼:", resp.status_code)
+    msg = MIMEMultipart()
+    msg["From"] = gmail_user
+    msg["To"] = receivers
+    msg["Subject"] = f"【每日零售輿情日報】三分類彙整（共 {total_count} 筆） - {today_tw[:10]}"
+
+    html_body = f"""
+    <html>
+      <body style="font-family: 'Microsoft JhengHei', sans-serif; line-height: 1.6;">
+        <h3>📊 零售通路每日輿情監測日報 ({today_tw})</h3>
+        <p>過去 3 天內共彙整 <b>{total_count} 筆</b>有效討論（涵蓋 Threads / PTT / Dcard，已排除團購廣告與動詞誤判）：</p>
+        <ul>
+          <li><b>1. 價格方面問題</b>：{len(df_price)} 筆</li>
+          <li><b>2. 員工抱怨與建議</b>：{len(df_employee)} 筆</li>
+          <li><b>3. 顧客抱怨與建議</b>：{len(df_customer)} 筆</li>
+        </ul>
+        <h4>📌 今日重點貼文速覽：</h4>
+        <ul>{preview_html}</ul>
+        <p>完整明細與原文超連結請直接下載本信件夾帶之 Excel 檔案：<b>{filename}</b></p>
+      </body>
+    </html>
+    """
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    with open(filename, "rb") as f:
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(f.read())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f"attachment; filename={filename}")
+    msg.attach(part)
+
+    receiver_list = [r.strip() for r in receivers.split(",") if r.strip()]
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(gmail_user, gmail_pass)
+        server.sendmail(gmail_user, receiver_list, msg.as_string())
+    print(f"已成功將日報與 Excel 附件寄送至：{receivers}")
 
 if __name__ == "__main__":
     session = requests.Session()
@@ -332,7 +334,7 @@ if __name__ == "__main__":
     df_customer = df_all[df_all["分類"] == "顧客抱怨與建議"].copy()
 
     date_tag = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y%m%d")
-    filename = f"跨平台輿情三分類_{date_tag}.xlsx"
+    filename = f"Retail_Monitor_Report_{date_tag}.xlsx"
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
         df_price.to_excel(writer, sheet_name="1_價格方面問題", index=False)
         df_employee.to_excel(writer, sheet_name="2_員工抱怨與建議", index=False)
