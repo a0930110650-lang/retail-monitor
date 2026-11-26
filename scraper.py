@@ -338,4 +338,4 @@ if __name__ == "__main__":
         df_employee.to_excel(writer, sheet_name="2_員工抱怨與建議", index=False)
         df_customer.to_excel(writer, sheet_name="3_顧客抱怨與建議", index=False)
 
-    send_to_teams(df_price, df_employee, df_customer, filename)
+    send_email_with_excel(df_price, df_employee, df_customer, filename)
