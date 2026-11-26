@@ -1,0 +1,36 @@
+name: Daily Retail Monitor
+
+on:
+  schedule:
+    # 台灣時間每天早上 08:30 自動執行 (UTC 00:30 = 台灣時間 08:30)
+    - cron: '30 0 * * *'
+  # 允許在 GitHub 網頁隨時手動點擊「Run workflow」測試執行
+  workflow_dispatch:
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下載程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝必要套件
+        run: pip install curl_cffi pandas openpyxl beautifulsoup4
+
+      - name: 執行爬蟲並發送 Teams 通知
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python scraper.py
+
+      - name: 上傳 Excel 報表供隨時下載
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-retail-report
+          path: 跨平台輿情三分類_*.xlsx
+          retention-days: 30
